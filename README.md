@@ -282,3 +282,6 @@ out. **Free the phone and connect** stops it (and Android File Transfer, if
 installed) so ShareLocal can open the phone; both come back by themselves the
 next time they are needed. No admin password is involved.
 
+## License
+
+[MIT](LICENSE) © 2026 Sreng Kuong

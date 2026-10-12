@@ -2,6 +2,7 @@
   "name": "sharelocal",
   "private": true,
   "version": "0.1.0",
+  "license": "MIT",
   "type": "module",
   "description": "Direct file sharing over your local network \u2014 no cloud, no account.",
   "scripts": {

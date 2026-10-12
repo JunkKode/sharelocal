@@ -1,0 +1,76 @@
+[package]
+name = "sharelocal"
+version = "0.1.0"
+description = "ShareLocal — direct LAN file sharing"
+edition = "2021"
+rust-version = "1.77"
+default-run = "sharelocal"
+
+[lib]
+name = "sharelocal"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8.4", features = ["ws", "http2"] }
+axum-server = { version = "0.7.2", features = ["tls-rustls"] }
+base64 = "0.23.1"
+bytes = "1.12.1"
+futures-util = "0.3.34"
+if-addrs = "0.15.0"
+include_dir = "0.7.4"
+libc = "0.2.189"
+mdns-sd = "0.21.3"
+mime_guess = "2.0.5"
+# Android phones over USB (MTP). Pure Rust on top of `nusb`: no libmtp or
+# libusb for the user to install.
+mtp-rs = "0.33"
+rand = "0.9.5"
+rcgen = "0.14.7"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls", "http2", "charset"] }
+rustls = { version = "0.23.44", features = ["ring"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+socket2 = { version = "0.6.5", features = ["all"] }
+subtle = "2.6.1"
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-opener = "2.5.5"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"] }
+tower = "0.5.3"
+tower-http = { version = "0.7.1", features = ["cors", "set-header"] }
+urlencoding = "2.1.3"
+uuid = { version = "1.20.0", features = ["v4"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+futures-util = "0.3.34"
+# A filesystem-backed fake phone, so the USB code is tested without hardware.
+mtp-rs = { version = "0.33", features = ["virtual-device"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
+uuid = "1.20.0"
+
+# Touch ID for the remembered Wi-Fi password, and the login keychain it lives in.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
+objc2-local-authentication = { version = "0.3", features = ["LAContext", "LAError", "block2"] }
+block2 = "0.6"
+security-framework = "3"
+objc2-app-kit = { version = "0.3", features = ["NSEvent", "block2"] }

@@ -1,0 +1,49 @@
+{
+  "name": "sharelocal",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Direct file sharing over your local network \u2014 no cloud, no account.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "node scripts/with-rust.mjs tauri",
+    "app": "node scripts/with-rust.mjs tauri dev",
+    "app:build": "node scripts/with-rust.mjs tauri build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:rust": "node scripts/with-rust.mjs cargo test --manifest-path src-tauri/Cargo.toml",
+    "typecheck": "tsc --noEmit",
+    "bench": "node scripts/with-rust.mjs cargo test --release --manifest-path src-tauri/Cargo.toml --test perf -- --ignored --nocapture",
+    "headless": "node scripts/with-rust.mjs cargo run --manifest-path src-tauri/Cargo.toml --example headless --",
+    "dmg": "bash scripts/make-dmg.sh",
+    "clean": "node scripts/clean.mjs",
+    "clean:all": "node scripts/clean.mjs --all"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2",
+    "@tauri-apps/plugin-notification": "^2",
+    "@tauri-apps/plugin-opener": "^2",
+    "qrcode": "^1.5.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4",
+    "@tauri-apps/cli": "^2",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.7",
+    "@types/qrcode": "^1.5.5",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5",
+    "jsdom": "^25",
+    "tailwindcss": "^4",
+    "typescript": "^5.7",
+    "vite": "^6",
+    "vitest": "^3.2.7"
+  }
+}

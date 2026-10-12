@@ -1,0 +1,134 @@
+@import "tailwindcss";
+
+/* Dark mode has three states, and all three have to work:
+     - `.dark` on <html>  — the user explicitly chose dark
+     - `.light` on <html> — the user explicitly chose light, so the system
+                            preference must be ignored
+     - neither            — "system", which follows prefers-color-scheme
+   A class-only variant would leave the whole UI in light colours on a device
+   set to dark, which is the default state for the browser client. */
+@custom-variant dark {
+  &:where(.dark, .dark *) {
+    @slot;
+  }
+  @media (prefers-color-scheme: dark) {
+    &:where(:root:not(.light), :root:not(.light) *) {
+      @slot;
+    }
+  }
+}
+
+@theme {
+  --color-brand-50: #f3f0ff;
+  --color-brand-100: #e9e3ff;
+  --color-brand-200: #d5cbff;
+  --color-brand-300: #b8a5ff;
+  --color-brand-400: #9575ff;
+  --color-brand-500: #7c4dff;
+  --color-brand-600: #6d28d9;
+  --color-brand-700: #5b21b6;
+  --color-brand-800: #4c1d95;
+  --color-brand-900: #3b1571;
+
+  --color-ink-50: #f7f7f9;
+  --color-ink-100: #eeeef2;
+  --color-ink-200: #dedee6;
+  --color-ink-300: #bcbcc9;
+  --color-ink-400: #8e8ea3;
+  --color-ink-500: #6b6b81;
+  --color-ink-600: #4e4e61;
+  --color-ink-700: #3a3a4a;
+  --color-ink-800: #23232e;
+  --color-ink-900: #16161d;
+  --color-ink-950: #0d0d12;
+
+  --radius-xl2: 1.125rem;
+  --animate-rise: rise 220ms cubic-bezier(0.22, 1, 0.36, 1);
+  --animate-pulse-ring: pulse-ring 2.2s ease-out infinite;
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulse-ring {
+  0%   { transform: scale(0.9); opacity: 0.55; }
+  70%  { transform: scale(1.6); opacity: 0; }
+  100% { transform: scale(1.6); opacity: 0; }
+}
+
+@keyframes sheen {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(300%); }
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-synthesis-weight: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  background: var(--color-ink-50);
+  color: var(--color-ink-900);
+  overscroll-behavior: none;
+}
+
+.dark body {
+  background: var(--color-ink-950);
+  color: var(--color-ink-100);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) body {
+    background: var(--color-ink-950);
+    color: var(--color-ink-100);
+  }
+}
+
+/* Keyboard users must always be able to see where they are. */
+:focus-visible {
+  outline: 2px solid var(--color-brand-500);
+  outline-offset: 2px;
+  border-radius: 0.5rem;
+}
+
+::selection {
+  background: var(--color-brand-200);
+  color: var(--color-brand-900);
+}
+
+/* Slim scrollbars that do not fight the dark theme. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, currentColor 22%, transparent) transparent;
+}
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, currentColor 20%, transparent);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+/* The window title bar area on macOS, so the app can be dragged by its header. */
+.drag-region {
+  -webkit-app-region: drag;
+}
+.drag-region button,
+.drag-region a,
+.drag-region input {
+  -webkit-app-region: no-drag;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

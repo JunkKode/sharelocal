@@ -1,0 +1,60 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ShareLocal",
+  "version": "0.1.0",
+  "identifier": "app.sharelocal.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "ShareLocal",
+        "width": 1120,
+        "height": 780,
+        "minWidth": 420,
+        "minHeight": 540,
+        "resizable": true,
+        "center": true,
+        "dragDropEnabled": true,
+        "titleBarStyle": "Visible"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: data: blob: http://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost ws: wss: http: https:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app",
+      "deb",
+      "rpm",
+      "appimage",
+      "nsis"
+    ],
+    "category": "Utility",
+    "shortDescription": "Direct file sharing over your local network",
+    "longDescription": "ShareLocal transfers files straight between devices on the same Wi-Fi or Ethernet network. No cloud, no account, no upload limits.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    },
+    "linux": {
+      "deb": {
+        "depends": []
+      }
+    }
+  }
+}

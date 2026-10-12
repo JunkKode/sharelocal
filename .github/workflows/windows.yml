@@ -1,0 +1,53 @@
+# Builds the Windows installer on a GitHub-hosted Windows machine, so no
+# Windows PC (or cross-compiler) is needed.
+#
+#   gh workflow run windows.yml          # start a build
+#   gh run watch                         # follow it
+#   gh run download -n ShareLocal-windows  # fetch the .exe
+#
+# Pushing a tag like `v0.2.0` also builds it.
+
+name: Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Keeps the second and later builds to a few minutes.
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: Front-end tests
+        run: npm test
+
+      - name: Rust unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      # Only the NSIS installer: the other bundle targets in tauri.conf.json
+      # belong to macOS and Linux.
+      - name: Build installer
+        run: npm run tauri -- build --bundles nsis
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShareLocal-windows
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error

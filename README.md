@@ -282,6 +282,22 @@ out. **Free the phone and connect** stops it (and Android File Transfer, if
 installed) so ShareLocal can open the phone; both come back by themselves the
 next time they are needed. No admin password is involved.
 
+## Releases
+
+Pushing a version tag builds both installers on GitHub and publishes them on
+the Releases page:
+
+```bash
+git tag v0.2.0 && git push --tags
+```
+
+The workflow ([`.github/workflows/build.yml`](.github/workflows/build.yml))
+builds the Windows installer and a universal macOS disk image (Apple Silicon
+and Intel) in parallel, then creates release **v0.2.0** with both files, the
+install notes from [`.github/release-notes.md`](.github/release-notes.md), and
+a list of changes since the previous tag. The tag sets the version — nothing
+needs editing first. `gh workflow run build.yml` builds without publishing.
+
 ## License
 
 [MIT](LICENSE) © 2026 Sreng Kuong

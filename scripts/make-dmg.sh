@@ -7,11 +7,14 @@
 # `hdiutil` needs neither, so this always works — it just looks plainer.
 set -euo pipefail
 
-APP_DIR="src-tauri/target/release/bundle/macos"
+# BUNDLE_DIR / ARCH can be overridden, e.g. for a universal build:
+#   BUNDLE_DIR=src-tauri/target/universal-apple-darwin/release/bundle ARCH=universal
+BUNDLE_DIR="${BUNDLE_DIR:-src-tauri/target/release/bundle}"
+APP_DIR="$BUNDLE_DIR/macos"
 APP_NAME="ShareLocal.app"
-OUT_DIR="src-tauri/target/release/bundle/dmg"
+OUT_DIR="$BUNDLE_DIR/dmg"
 VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
-ARCH="$(uname -m)"
+ARCH="${ARCH:-$(uname -m)}"
 DMG="$OUT_DIR/ShareLocal_${VERSION}_${ARCH}.dmg"
 
 if [ ! -d "$APP_DIR/$APP_NAME" ]; then

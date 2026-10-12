@@ -39,6 +39,25 @@ async fn a_file_arrives_byte_for_byte() {
     }
 }
 
+/// A fresh install has no `Downloads/ShareLocal` folder yet; the very first
+/// transfer must create it rather than fail.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_transfer_creates_a_missing_download_folder() {
+    let sender = start_node("Sender", false).await;
+    let receiver = start_node("Receiver", true).await;
+    std::fs::remove_dir_all(&receiver.downloads).unwrap();
+
+    let source = sender.dir.join("first.jpg");
+    let expected = make_file(&source, 64 * 1024);
+
+    let peer = receiver.as_peer().await;
+    let session_id = start_send(&sender.state, peer, vec![source], None).await.unwrap();
+
+    let finished = await_terminal(&sender, &session_id, T).await;
+    assert_eq!(finished.status, SessionStatus::Completed, "{:?}", finished.error);
+    assert_eq!(std::fs::read(receiver.downloads.join("first.jpg")).unwrap(), expected);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn folder_structure_survives_the_hop() {
     let sender = start_node("Sender", false).await;

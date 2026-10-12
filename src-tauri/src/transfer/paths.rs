@@ -130,6 +130,12 @@ pub fn sanitize_rel_path(input: &str) -> Result<PathBuf, TransferError> {
 /// This is belt-and-braces on top of [`sanitize_rel_path`]: if the download
 /// folder itself contains a symlink planted by something else, we still refuse
 /// to write outside it.
+///
+/// The download folder is created here if it does not exist yet. Both sides of
+/// the comparison must be real (canonical) paths, and a missing folder has
+/// none: comparing its plain path against a canonical ancestor refused every
+/// file on a fresh install — on Windows always, since canonical paths there
+/// carry a `\\?\` prefix.
 pub fn resolve_dest(root: &Path, rel: &Path) -> Result<PathBuf, TransferError> {
     for comp in rel.components() {
         match comp {
@@ -139,7 +145,11 @@ pub fn resolve_dest(root: &Path, rel: &Path) -> Result<PathBuf, TransferError> {
     }
     let candidate = root.join(rel);
 
-    let real_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    std::fs::create_dir_all(root)
+        .map_err(|e| crate::transfer::io_error(&e, "creating the download folder"))?;
+    let real_root = root
+        .canonicalize()
+        .map_err(|e| crate::transfer::io_error(&e, "opening the download folder"))?;
     // Canonicalise the deepest existing ancestor; the tail does not exist yet.
     let mut existing = candidate.as_path();
     let real_existing = loop {
@@ -346,6 +356,26 @@ mod tests {
         assert!(ok.starts_with(&root));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A fresh install: the download folder (`Downloads/ShareLocal`) does not
+    /// exist until the first file arrives. That first file must not be
+    /// refused — on Windows it was, as "escaping" the folder, because the
+    /// missing folder could not be resolved to its real path.
+    #[test]
+    fn resolve_dest_works_before_the_download_folder_exists() {
+        let base = std::env::temp_dir().join(format!("sl-fresh-{}", uuid::Uuid::new_v4()));
+        let root = base.join("Downloads").join("ShareLocal");
+        assert!(!root.exists());
+
+        let dest = resolve_dest(&root, Path::new("photo.jpg")).expect("first file is accepted");
+        assert_eq!(dest, root.join("photo.jpg"));
+        assert!(root.is_dir(), "the download folder is created on demand");
+
+        let nested = resolve_dest(&root, Path::new("Trip/day1/a.jpg")).unwrap();
+        assert!(nested.starts_with(&root));
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[cfg(unix)]

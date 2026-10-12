@@ -3,7 +3,7 @@
 #
 #   git tag v0.2.0 && git push --tags     # build + publish release v0.2.0
 #   gh workflow run build.yml             # build only (files under the run's artifacts)
-#   gh run download -n ShareLocal-windows  # fetch a manual build's .exe
+#   gh run download -n ShareLocal-windows-x64  # fetch a manual build's .exe
 #
 # The tag sets the version: `v0.2.0` builds ShareLocal 0.2.0, so there is no
 # need to edit tauri.conf.json before tagging.
@@ -20,6 +20,17 @@ permissions:
 
 jobs:
   windows:
+    # 64-bit for every current PC; 32-bit for older Windows 10 machines
+    # (Windows 11 has no 32-bit edition).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x64
+          - target: i686-pc-windows-msvc
+            arch: x86
+    name: windows (${{ matrix.arch }})
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -31,11 +42,14 @@ jobs:
           cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       # Keeps the second and later builds to a few minutes.
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          key: ${{ matrix.target }}
 
       - run: npm ci
 
@@ -44,21 +58,24 @@ jobs:
         shell: bash
         run: node scripts/set-version.mjs "${GITHUB_REF_NAME#v}"
 
+      # Tests once, on the 64-bit build; the code is the same for both.
       - name: Front-end tests
+        if: matrix.arch == 'x64'
         run: npm test
 
       - name: Rust unit tests
+        if: matrix.arch == 'x64'
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 
       # Only the NSIS installer: the other bundle targets in tauri.conf.json
       # belong to macOS and Linux.
       - name: Build installer
-        run: npm run tauri -- build --bundles nsis
+        run: npm run tauri -- build --target ${{ matrix.target }} --bundles nsis
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ShareLocal-windows
-          path: src-tauri/target/release/bundle/nsis/*.exe
+          name: ShareLocal-windows-${{ matrix.arch }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
           if-no-files-found: error
 
   macos:
@@ -73,6 +90,7 @@ jobs:
           cache: npm
 
       # Both architectures, so one .dmg runs on Apple Silicon and Intel Macs.
+      # The oldest macOS it accepts is `minimumSystemVersion` in tauri.conf.json.
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin

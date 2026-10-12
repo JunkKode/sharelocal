@@ -292,8 +292,8 @@ git tag v0.2.0 && git push --tags
 ```
 
 The workflow ([`.github/workflows/build.yml`](.github/workflows/build.yml))
-builds the Windows installer and a universal macOS disk image (Apple Silicon
-and Intel) in parallel, then creates release **v0.2.0** with both files, the
+builds the Windows installers (64-bit and 32-bit) and a universal macOS disk
+image (Apple Silicon and Intel, macOS 11+) in parallel, then creates release **v0.2.0** with both files, the
 install notes from [`.github/release-notes.md`](.github/release-notes.md), and
 a list of changes since the previous tag. The tag sets the version — nothing
 needs editing first. `gh workflow run build.yml` builds without publishing.

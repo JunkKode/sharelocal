@@ -4407,7 +4407,7 @@ dependencies = [
 
 [[package]]
 name = "sharelocal"
-version = "0.1.0"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -4422,6 +4422,7 @@ dependencies = [
  "mdns-sd",
  "mime_guess",
  "mtp-rs",
+ "nusb",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",

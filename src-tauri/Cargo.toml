@@ -1,6 +1,6 @@
 [package]
 name = "sharelocal"
-version = "0.1.0"
+version = "0.2.3"
 description = "ShareLocal — direct LAN file sharing"
 edition = "2021"
 license = "MIT"
@@ -29,6 +29,7 @@ mime_guess = "2.0.5"
 # Android phones over USB (MTP). Pure Rust on top of `nusb`: no libmtp or
 # libusb for the user to install.
 mtp-rs = "0.33"
+nusb = "0.2"
 rand = "0.9.5"
 rcgen = "0.14.7"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls", "http2", "charset"] }

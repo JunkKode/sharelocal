@@ -215,4 +215,102 @@ describe("UsbView", () => {
     expect(hiddenName.closest("span")).toHaveClass("opacity-45");
     expect(screen.getByRole("button", { name: "DCIM" }).closest("span")).not.toHaveClass("opacity-45");
   });
+
+  it("orders files from newer date to older date by default", async () => {
+    const dated: UsbEntry[] = [
+      { handle: "1", name: "old.jpg", size: 100, folder: false, modified_ms: 1_700_000_000_000, kind: "image" },
+      { handle: "2", name: "newest.jpg", size: 100, folder: false, modified_ms: 1_760_000_000_000, kind: "image" },
+      { handle: "3", name: "middle.jpg", size: 100, folder: false, modified_ms: 1_730_000_000_000, kind: "image" },
+      { handle: "4", name: "Albums", size: 0, folder: true, modified_ms: 1_600_000_000_000, kind: "folder" },
+    ];
+    const { api } = fakeApi({ list: vi.fn().mockResolvedValue(dated) });
+    renderUsb(api);
+    await screen.findByText("newest.jpg");
+    const rowLabels = screen
+      .getAllByRole("checkbox")
+      .map((el) => el.getAttribute("aria-label"))
+      .filter((label): label is string => Boolean(label && label !== "Select all"));
+    expect(rowLabels).toEqual([
+      "Select Albums",
+      "Select newest.jpg",
+      "Select middle.jpg",
+      "Select old.jpg",
+    ]);
+  });
+
+  it("shows a full-image hover tooltip for photos and upgrades to the full preview", async () => {
+    const photos: UsbEntry[] = [
+      { handle: "50", name: "sunset.jpg", size: 420_000, folder: false, modified_ms: 1_760_000_000_000, kind: "image" },
+    ];
+    const thumbUrl = "data:image/jpeg;base64,thumb";
+    const fullUrl = "data:image/jpeg;base64,full";
+    const preview = vi.fn().mockResolvedValue(fullUrl);
+    const { api } = fakeApi({
+      connect: vi.fn().mockResolvedValue({
+        id: pixel.id,
+        name: pixel.name,
+        storages: [{ id: "65537", name: "Internal shared storage", total: 128e9, free: 40e9, writable: true }],
+        can_upload: true,
+        can_delete: true,
+        thumbnails: true,
+      }),
+      list: vi.fn().mockResolvedValue(photos),
+      thumbnail: vi.fn().mockResolvedValue(thumbUrl),
+      preview,
+    });
+    renderUsb(api);
+    const label = await screen.findByText("sunset.jpg");
+
+    // Hovering the filename cell itself must NOT pop up the preview tooltip.
+    await userEvent.hover(label);
+    expect(screen.queryByRole("tooltip", { name: "Preview of sunset.jpg" })).not.toBeInTheDocument();
+
+    // Hovering the thumbnail opens the preview and upgrades it to the full image.
+    const thumb = label.closest("li")!.querySelector("[data-thumb]")!;
+    await userEvent.hover(thumb);
+
+    const tooltip = await screen.findByRole("tooltip", { name: "Preview of sunset.jpg" });
+    expect(tooltip).toBeInTheDocument();
+    await waitFor(() => expect(preview).toHaveBeenCalledWith("65537", "50"));
+    await waitFor(() => {
+      const img = tooltip.querySelector("img");
+      expect(img).toHaveAttribute("src", fullUrl);
+      expect(img).toHaveClass("object-contain");
+    });
+
+    await userEvent.unhover(thumb);
+    expect(screen.queryByRole("tooltip", { name: "Preview of sunset.jpg" })).not.toBeInTheDocument();
+  });
+
+  it("tells the user when a plugged-in Android phone is in charging-only mode", async () => {
+    const { api } = fakeApi({
+      devices: vi.fn().mockResolvedValue([
+        { id: "non-mtp-1-2", name: "Samsung Galaxy", serial: null, speed: "USB 2", mtp_ready: false },
+      ]),
+    });
+    renderUsb(api);
+    expect(await screen.findByText("Samsung Galaxy is connected for charging only")).toBeInTheDocument();
+    expect(api.connect).not.toHaveBeenCalled();
+  });
+
+  it("opens a folder when clicking anywhere on its row, while its checkbox selects it", async () => {
+    const { api } = fakeApi();
+    renderUsb(api);
+    const dcimCheckbox = await screen.findByLabelText("Select DCIM");
+    const dcimRow = dcimCheckbox.closest("li")!;
+
+    // Clicking the checkbox selects the folder without navigating into it.
+    await userEvent.click(dcimCheckbox);
+    expect(dcimCheckbox).toBeChecked();
+    expect(screen.queryByLabelText("Select Camera")).not.toBeInTheDocument();
+
+    // The selection bar renders below the list so rows never jump.
+    const list = dcimRow.closest("ul")!;
+    const selectionBar = document.querySelector("[data-selection-bar]")!;
+    expect(list.compareDocumentPosition(selectionBar) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    // Clicking the row cell itself opens the folder.
+    await userEvent.click(dcimRow);
+    expect(await screen.findByLabelText("Select Camera")).toBeInTheDocument();
+  });
 });

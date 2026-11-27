@@ -81,6 +81,8 @@ export const desktop = {
     invoke<UsbEntry[]>("usb_list", { storage, parent, hidden }),
   usbThumbnail: (storage: string, handle: string) =>
     invoke<string>("usb_thumbnail", { storage, handle }),
+  usbPreview: (storage: string, handle: string) =>
+    invoke<string>("usb_preview", { storage, handle }),
   usbCreateFolder: (storage: string, parent: string | null, name: string) =>
     invoke<string>("usb_create_folder", { storage, parent, name }),
   usbDelete: (storage: string, handles: string[]) => invoke<void>("usb_delete", { storage, handles }),

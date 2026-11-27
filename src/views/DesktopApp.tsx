@@ -114,6 +114,7 @@ export function DesktopApp() {
       storages: desktop.usbStorages,
       list: desktop.usbList,
       thumbnail: desktop.usbThumbnail,
+      preview: desktop.usbPreview,
       createFolder: desktop.usbCreateFolder,
       remove: desktop.usbDelete,
       download: desktop.usbDownload,

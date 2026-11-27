@@ -10,7 +10,7 @@ use crate::model::{
 };
 use crate::state::AppState;
 use crate::transfer::session::Session;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Query, State};
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
@@ -24,7 +24,12 @@ use tokio::sync::Mutex;
 /// A control connection that goes silent for this long is dropped. It must
 /// stay comfortably above the sender's heartbeat interval, or a long transfer
 /// would be torn down mid-flight.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// WebSocket close code sent when a browser reconnects with an expired or
+/// unknown pairing token, so the page knows to ask for a fresh QR scan instead
+/// of looping on a dead token or pretending to be connected.
+pub const CLOSE_AUTH_EXPIRED: u16 = 4001;
 
 /// How often the server pings a connection. Browsers answer a WebSocket ping
 /// on their own, so this also keeps a phone that only listens from tripping
@@ -35,7 +40,7 @@ pub const PING_EVERY: Duration = Duration::from_secs(15);
 pub const PRESENCE_EVERY: Duration = Duration::from_secs(4);
 /// A browser that has said nothing (not even a pong) for this long is
 /// treated as gone, even if the socket has not noticed yet.
-pub const PRESENCE_GRACE: Duration = Duration::from_secs(40);
+pub const PRESENCE_GRACE: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Deserialize, Default)]
 pub struct WsQuery {
@@ -55,18 +60,64 @@ pub async fn upgrade(
         .on_upgrade(move |socket| handle(socket, state, addr, query))
 }
 
-async fn handle(socket: WebSocket, state: Arc<AppState>, addr: SocketAddr, query: WsQuery) {
+async fn handle(mut socket: WebSocket, state: Arc<AppState>, addr: SocketAddr, query: WsQuery) {
     // A paired browser client sees events for its own sessions; an unpaired
-    // LAN peer only ever sees replies to what it asks for.
+    // LAN peer only ever sees replies to what it asks for. If a browser
+    // presents credentials that are no longer valid (desktop restarted or
+    // pairing expired), reject explicitly so the client does not stay stuck
+    // thinking it is connected.
+    let is_web_attempt = query.client_id.is_some() || query.token.is_some();
     let web_client = match (&query.client_id, &query.token) {
         (Some(id), Some(token)) => state.authenticate_web(id, token).await,
         _ => None,
     };
+    if is_web_attempt && web_client.is_none() {
+        let _ = socket
+            .send(Message::Close(Some(CloseFrame {
+                code: CLOSE_AUTH_EXPIRED,
+                reason: "session-expired".into(),
+            })))
+            .await;
+        return;
+    }
+
+    if let Some(client) = &web_client {
+        state.update_web_client_addr(&client.id, addr.ip()).await;
+        state.touch_web_client(&client.id).await;
+    }
 
     let (sink, mut stream) = socket.split();
     let sink = Arc::new(Mutex::new(sink));
     // Sessions this connection is party to, used to filter the event feed.
     let owned: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    // Replay any active pull offers meant for this browser, so a phone that
+    // woke up or reopened its browser sees files sent while it was away.
+    if let Some(client) = &web_client {
+        let pending: Vec<crate::model::SessionView> = {
+            let sessions = state.sessions.read().await;
+            sessions
+                .views()
+                .into_iter()
+                .filter(|s| {
+                    s.peer.id == client.id
+                        && s.role == Role::Sending
+                        && s.direction == Direction::Pull
+                        && !s.status.is_terminal()
+                })
+                .collect()
+        };
+        for session in pending {
+            owned.lock().await.insert(session.id.clone());
+            let _ = send(
+                &sink,
+                ControlMsg::Event {
+                    event: crate::events::AppEvent::IncomingOffer { session },
+                },
+            )
+            .await;
+        }
+    }
 
     let forwarder = spawn_event_forwarder(
         state.clone(),
@@ -95,7 +146,10 @@ async fn handle(socket: WebSocket, state: Arc<AppState>, addr: SocketAddr, query
             );
         }
         let msg = match next {
-            Err(_) => break,
+            Err(_) => {
+                let _ = sink.lock().await.send(Message::Close(None)).await;
+                break;
+            }
             Ok(None) => break,
             Ok(Some(Err(_))) => break,
             Ok(Some(Ok(msg))) => msg,

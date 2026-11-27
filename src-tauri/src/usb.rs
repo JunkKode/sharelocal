@@ -26,8 +26,41 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// than offer something that fails.
 const APPLE_VENDOR_ID: u16 = 0x05ac;
 const UPLOAD_CHUNK: usize = 256 * 1024;
+/// Largest image we will read in full for a hover preview (20 MB). Larger
+/// files keep showing their MTP thumbnail instead of blocking USB.
+const MAX_PREVIEW_BYTES: u64 = 20 * 1024 * 1024;
 /// How often a running transfer reports progress.
 const REPORT_EVERY: Duration = Duration::from_millis(120);
+
+/// USB Miscellaneous / IAD composite device class. Many Android phones use this
+/// when MTP is combined with ADB or CDC/modem interfaces, which `mtp-rs`'s
+/// default class filter (`0x00` / `0xFF`) skips unless passed via `known`.
+const USB_CLASS_MISC_IAD: u8 = 0xEF;
+const USB_CLASS_IMAGE: u8 = 0x06;
+const USB_CLASS_VENDOR: u8 = 0xFF;
+const USB_SUBCLASS_ADB: u8 = 0x42;
+const USB_PROTOCOL_ADB: u8 = 0x01;
+
+/// USB Vendor IDs dedicated to Android phone makers. Used only to tell the user
+/// "your phone is plugged in, switch it to File transfer" when the cable works
+/// for data but the phone is still in Charging-only mode.
+const ANDROID_PHONE_VIDS: &[u16] = &[
+    0x18d1, // Google
+    0x04e8, // Samsung
+    0x2717, // Xiaomi
+    0x22d9, // OPPO / Realme / OnePlus
+    0x2a70, // OnePlus
+    0x2d95, // Vivo / iQOO
+    0x12d1, // Huawei
+    0x34e0, // Honor
+    0x22b8, // Motorola
+    0x0bb4, // HTC
+    0x19d2, // ZTE / Nubia
+    0x2ae5, // Fairphone
+    0x2a45, // Meizu
+    0x2e04, // HMD / Nokia
+    0x34c6, // Nothing
+];
 
 // ----------------------------------------------------------------- views
 
@@ -41,6 +74,9 @@ pub struct UsbDevice {
     /// "USB 2", "USB 3 (5 Gbps)" … — a slow cable is the usual cause of a slow
     /// copy, so it is worth showing.
     pub speed: Option<&'static str>,
+    /// False when macOS sees the Android phone on the cable (e.g. Charging-only
+    /// or ADB-only mode) but the phone has not turned on File transfer (MTP).
+    pub mtp_ready: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,9 +135,19 @@ impl From<mtp_rs::Error> for UsbError {
         if e.is_exclusive_access() {
             return Self::new("exclusive", "Another app is using the phone.");
         }
+        if is_not_responding(&e) {
+            return Self::new(
+                "not-responding",
+                "The phone stopped responding over USB (0xe00002ed). This often happens with a phone charger cable that cannot carry stable data, or when the phone’s USB link stalls. Unplug and reconnect, make sure “File transfer” is selected, or try another USB data cable.",
+            );
+        }
         match e {
             E::PermissionDenied => Self::new("permission", "The system would not let ShareLocal open the phone."),
             E::Disconnected => Self::new("disconnected", "The phone was disconnected."),
+            E::Timeout => Self::new(
+                "timeout",
+                "The phone did not respond in time. Unlock it, make sure “File transfer” is selected, and try again.",
+            ),
             E::StorageFull => Self::new("full", "There is not enough free space on the phone."),
             E::Cancelled => Self::new("cancelled", "Cancelled."),
             E::Busy => Self::new("busy", "The phone is busy. Try again in a moment."),
@@ -116,6 +162,22 @@ impl From<mtp_rs::Error> for UsbError {
             other => Self::new("other", other.to_string()),
         }
     }
+}
+
+/// macOS IOKit `kIOReturnNotResponding` (`0xe00002ed`): the USB host got no
+/// handshake from the phone (flaky/charging cable, USB-C renegotiation, or
+/// stalled bulk pipe).
+pub fn is_not_responding_msg(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("0xe00002ed") || lower.contains("not responding")
+}
+
+fn is_not_responding(e: &mtp_rs::Error) -> bool {
+    is_not_responding_msg(&e.to_string())
+}
+
+fn is_transient_open_error(e: &mtp_rs::Error) -> bool {
+    matches!(e, mtp_rs::Error::Timeout | mtp_rs::Error::Busy) || is_not_responding(e)
 }
 
 impl From<mtp_rs::UploadError> for UsbError {
@@ -162,18 +224,218 @@ impl UsbProgress {
 // ------------------------------------------------------------- discovery
 
 /// Phones plugged in right now. Cheap enough to poll every couple of seconds.
+///
+/// Augments `mtp-rs`'s default scan with `0xEF` (IAD composite) Android phones
+/// and broader `"MTP"` interface-string matching, and also reports Android
+/// phones that macOS sees on the cable in Charging-only / ADB-only mode so the
+/// UI can tell the user to switch USB mode instead of saying nothing was found.
 pub fn list_devices() -> Vec<UsbDevice> {
-    MtpDevice::list_devices()
+    let extra_known = extra_mtp_vid_pids();
+    let mtp_devices: Vec<_> = MtpDevice::list_devices_with_known(&extra_known)
         .unwrap_or_default()
         .into_iter()
         .filter(|d| d.vendor_id != APPLE_VENDOR_ID)
+        .collect();
+
+    let mut out: Vec<UsbDevice> = mtp_devices
+        .iter()
         .map(|d| UsbDevice {
             id: d.location_id.to_string(),
             name: display_name(d.manufacturer.as_deref(), d.product.as_deref()),
             serial: d.serial_number.clone(),
             speed: d.speed.map(speed_label),
+            mtp_ready: true,
         })
-        .collect()
+        .collect();
+
+    // If an Android phone is visible on USB but not exposing MTP yet (e.g.
+    // plugged in with "Charging this device via USB" / ADB only), list it with
+    // `mtp_ready: false` so the UI knows the cable works for data.
+    let matched_vid_pids: Vec<(u16, u16, Option<&str>)> = mtp_devices
+        .iter()
+        .map(|d| (d.vendor_id, d.product_id, d.serial_number.as_deref()))
+        .collect();
+
+    use nusb::MaybeFuture;
+    if let Ok(all) = nusb::list_devices().wait() {
+        for dev in all {
+            if dev.vendor_id() == APPLE_VENDOR_ID {
+                continue;
+            }
+            let already = matched_vid_pids.iter().any(|&(v, p, s)| {
+                v == dev.vendor_id()
+                    && p == dev.product_id()
+                    && (s.is_none() || s == dev.serial_number())
+            });
+            if already {
+                continue;
+            }
+            let has_adb = dev.interfaces().any(|i| {
+                i.class() == USB_CLASS_VENDOR
+                    && i.subclass() == USB_SUBCLASS_ADB
+                    && i.protocol() == USB_PROTOCOL_ADB
+            });
+            let interface_classes: Vec<u8> = dev.interfaces().map(|i| i.class()).collect();
+            if looks_like_android_non_mtp(
+                dev.vendor_id(),
+                dev.class(),
+                &interface_classes,
+                has_adb,
+                dev.manufacturer_string(),
+                dev.product_string(),
+            ) {
+                out.push(UsbDevice {
+                    id: format!("non-mtp-{}-{}", dev.bus_id(), dev.device_address()),
+                    name: display_name(dev.manufacturer_string(), dev.product_string()),
+                    serial: dev.serial_number().map(String::from),
+                    speed: dev.speed().and_then(nusb_speed_label),
+                    mtp_ready: false,
+                });
+            }
+        }
+    }
+
+    out
+}
+
+/// Find `(VID, PID)` pairs of attached MTP devices that `mtp-rs`'s default scan
+/// misses — notably `0xEF` (Miscellaneous / IAD composite) Android phones and
+/// interfaces whose descriptor string contains "MTP" (e.g. "MTP USB Device").
+fn extra_mtp_vid_pids() -> Vec<(u16, u16)> {
+    use nusb::MaybeFuture;
+    let Ok(devices) = nusb::list_devices().wait() else {
+        return Vec::new();
+    };
+    let mut known = Vec::new();
+    for dev in devices {
+        if dev.vendor_id() == APPLE_VENDOR_ID {
+            continue;
+        }
+        let pair = (dev.vendor_id(), dev.product_id());
+        if known.contains(&pair) {
+            continue;
+        }
+        if !matches!(dev.class(), 0x00 | USB_CLASS_MISC_IAD | USB_CLASS_VENDOR) {
+            continue;
+        }
+        let summary_match = dev.interfaces().any(|i| {
+            is_mtp_interface_summary(i.class(), i.subclass(), i.protocol(), i.interface_string())
+        });
+        if summary_match {
+            known.push(pair);
+            continue;
+        }
+        // For 0xEF composite devices, `mtp-rs` returns early before checking
+        // endpoint layout; inspect the active configuration descriptors here.
+        // Only match Android's f_mtp vendor descriptor (0xFF/0xFF/0x00) or
+        // standard MTP class so we do not open unrelated modem/diag interfaces.
+        if dev.class() == USB_CLASS_MISC_IAD {
+            if let Ok(opened) = dev.open().wait() {
+                if let Ok(cfg) = opened.active_configuration() {
+                    let has_mtp = cfg.interfaces().any(|iface| {
+                        iface.alt_settings().next().is_some_and(|alt| {
+                            is_mtp_interface_summary(alt.class(), alt.subclass(), alt.protocol(), None)
+                                || (alt.class() == USB_CLASS_VENDOR
+                                    && alt.subclass() == USB_CLASS_VENDOR
+                                    && alt.protocol() == 0x00
+                                    && has_mtp_endpoints(&alt))
+                        })
+                    });
+                    if has_mtp {
+                        known.push(pair);
+                    }
+                }
+            }
+        }
+    }
+    known
+}
+
+fn has_mtp_endpoints(alt: &nusb::descriptors::InterfaceDescriptor<'_>) -> bool {
+    use nusb::descriptors::TransferType;
+    use nusb::transfer::Direction;
+    let mut bulk_in = false;
+    let mut bulk_out = false;
+    let mut intr_in = false;
+    for ep in alt.endpoints() {
+        match (ep.direction(), ep.transfer_type()) {
+            (Direction::In, TransferType::Bulk) => bulk_in = true,
+            (Direction::Out, TransferType::Bulk) => bulk_out = true,
+            (Direction::In, TransferType::Interrupt) => intr_in = true,
+            _ => {}
+        }
+    }
+    bulk_in && bulk_out && intr_in
+}
+
+pub fn is_mtp_interface_summary(
+    class: u8,
+    subclass: u8,
+    protocol: u8,
+    interface_string: Option<&str>,
+) -> bool {
+    if (class == USB_CLASS_IMAGE || class == USB_CLASS_VENDOR) && subclass == 0x01 && protocol == 0x01 {
+        return true;
+    }
+    interface_string
+        .map(|s| s.to_ascii_lowercase().contains("mtp"))
+        .unwrap_or(false)
+}
+
+/// Heuristic for an Android phone plugged in over a working data cable but not
+/// yet switched to File transfer (MTP) mode. Excludes hubs, keyboards/mice,
+/// audio interfaces, and storage-only sticks so unrelated peripherals never
+/// trigger a false prompt.
+pub fn looks_like_android_non_mtp(
+    vendor_id: u16,
+    device_class: u8,
+    interface_classes: &[u8],
+    has_adb: bool,
+    manufacturer: Option<&str>,
+    product: Option<&str>,
+) -> bool {
+    if vendor_id == APPLE_VENDOR_ID || device_class == 0x09 {
+        // Never Apple, never USB hubs.
+        return false;
+    }
+    if has_adb {
+        return true;
+    }
+    // Pure HID (3), Audio (1), Hub (9), Video (14), Mass Storage (8) peripherals
+    // without vendor/comm/misc interfaces are accessories, not phones.
+    let all_peripheral = !interface_classes.is_empty()
+        && interface_classes
+            .iter()
+            .all(|c| matches!(c, 0x01 | 0x03 | 0x07 | 0x08 | 0x09 | 0x0e));
+    if all_peripheral {
+        return false;
+    }
+    if ANDROID_PHONE_VIDS.contains(&vendor_id) {
+        return true;
+    }
+    let combined = format!(
+        "{} {}",
+        manufacturer.unwrap_or_default(),
+        product.unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    [
+        "android", "pixel", "galaxy", "redmi", "xiaomi", "poco", "oneplus", "oppo", "realme",
+        "vivo", "iqoo", "tecno", "infinix", "huawei", "honor", "xperia", "nothing phone",
+    ]
+    .iter()
+    .any(|kw| combined.contains(kw))
+}
+
+fn nusb_speed_label(speed: nusb::Speed) -> Option<&'static str> {
+    use nusb::Speed as S;
+    match speed {
+        S::Low | S::Full => Some("USB 1"),
+        S::High => Some("USB 2"),
+        S::Super => Some("USB 3 (5 Gbps)"),
+        S::SuperPlus => Some("USB 3 (10 Gbps)"),
+        _ => None,
+    }
 }
 
 fn display_name(manufacturer: Option<&str>, product: Option<&str>) -> String {
@@ -204,7 +466,10 @@ pub async fn open(id: &str, release: bool) -> Result<MtpDevice, UsbError> {
     let location: u64 = id
         .parse()
         .map_err(|_| UsbError::new("invalid", "Unknown USB device."))?;
-    let attempts = if release { 8 } else { 1 };
+    // Even without `release`, allow brief spaced retries for transient USB
+    // settle errors (like macOS 0xe00002ed right after plugging in or switching
+    // to File transfer).
+    let attempts = if release { 8 } else { 3 };
     let mut last = None;
 
     for attempt in 0..attempts {
@@ -212,17 +477,26 @@ pub async fn open(id: &str, release: bool) -> Result<MtpDevice, UsbError> {
             release_holders().await;
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
-        match MtpDevice::builder().open_by_location(location).await {
+        let extra_known = tokio::task::spawn_blocking(extra_mtp_vid_pids)
+            .await
+            .unwrap_or_default();
+        match MtpDevice::builder()
+            .known_devices(&extra_known)
+            .open_by_location(location)
+            .await
+        {
             Ok(device) => return Ok(device),
             Err(e) => {
-                // The holder can be relaunched by launchd in the gap between
-                // stopping it and claiming the phone, so keep trying briefly.
-                let retry = e.is_exclusive_access() && attempt + 1 < attempts;
+                // Retry exclusive-access races when releasing holders, and
+                // transient USB settle/not-responding errors on initial open.
+                let can_retry = (release && e.is_exclusive_access()) || is_transient_open_error(&e);
+                let retry = can_retry && attempt + 1 < attempts;
                 last = Some(e);
                 if !retry {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(350)).await;
+                let delay = if release { 350 } else { 450 * (attempt as u64 + 1) };
+                tokio::time::sleep(Duration::from_millis(delay)).await;
             }
         }
     }
@@ -357,8 +631,9 @@ fn parent_handle(parent: Option<&str>) -> Result<Option<ObjectHandle>, UsbError>
         .transpose()
 }
 
-/// One folder's contents, folders first, then by name. Dot-files are left out
-/// unless `show_hidden`.
+/// One folder's contents: folders first, then newer date to older date (with
+/// name as a deterministic tie-breaker). Dot-files are left out unless
+/// `show_hidden`.
 pub async fn list(
     device: &MtpDevice,
     storage_id: &str,
@@ -375,12 +650,17 @@ pub async fn list(
         .filter(|o| show_hidden || !o.filename.starts_with('.'))
         .map(|o| entry(o, offset))
         .collect();
+    sort_entries(&mut entries);
+    Ok(entries)
+}
+
+pub fn sort_entries(entries: &mut [UsbEntry]) {
     entries.sort_by(|a, b| {
         b.folder
             .cmp(&a.folder)
+            .then_with(|| b.modified_ms.cmp(&a.modified_ms))
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    Ok(entries)
 }
 
 fn entry(object: &ObjectInfo, offset: UtcOffset) -> UsbEntry {
@@ -430,11 +710,74 @@ pub async fn thumbnail(device: &MtpDevice, storage_id: &str, handle: &str) -> Re
     if bytes.is_empty() {
         return Err(UsbError::new("unsupported", "No thumbnail."));
     }
-    let mime = if bytes.starts_with(b"\x89PNG") { "image/png" } else { "image/jpeg" };
+    let mime = image_mime("", &bytes);
     Ok(format!(
         "data:{mime};base64,{}",
         base64::engine::general_purpose::STANDARD.encode(bytes)
     ))
+}
+
+/// Full image bytes as a data URL for the hover preview tooltip. Bounded by
+/// [`MAX_PREVIEW_BYTES`] so hovering a huge file never stalls USB or RAM.
+pub async fn preview(device: &MtpDevice, storage_id: &str, handle: &str) -> Result<String, UsbError> {
+    use base64::Engine;
+    let storage = storage(device, storage_id).await?;
+    let handle = ObjectHandle(parse_id(handle, "file")?);
+    let info = storage.get_object_info(handle).await?;
+    if info.is_folder() || kind_of(&info) != "image" {
+        return Err(UsbError::new("unsupported", "Preview is only available for images."));
+    }
+    if info.size == 0 || info.size > MAX_PREVIEW_BYTES {
+        return Err(UsbError::new("unsupported", "Image is too large for inline preview."));
+    }
+    let mut stream = storage.download(handle, ByteRange::Full).await?;
+    let mut bytes = Vec::with_capacity(info.size.min(MAX_PREVIEW_BYTES) as usize);
+    while let Some(chunk) = stream.next_chunk().await {
+        let chunk = chunk?;
+        if bytes.len() as u64 + chunk.len() as u64 > MAX_PREVIEW_BYTES {
+            let _ = stream.cancel(mtp_rs::DEFAULT_CANCEL_TIMEOUT).await;
+            return Err(UsbError::new("unsupported", "Image is too large for inline preview."));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() {
+        return Err(UsbError::new("unsupported", "Empty image."));
+    }
+    let mime = image_mime(&info.filename, &bytes);
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+fn image_mime(filename: &str, bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return "image/png";
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return "image/jpeg";
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return "image/gif";
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return "image/webp";
+    }
+    if bytes.starts_with(b"BM") {
+        return "image/bmp";
+    }
+    if let Some(ext) = Path::new(filename).extension().and_then(|e| e.to_str()) {
+        match ext.to_ascii_lowercase().as_str() {
+            "png" => return "image/png",
+            "webp" => return "image/webp",
+            "gif" => return "image/gif",
+            "heic" | "heif" => return "image/heic",
+            "avif" => return "image/avif",
+            "bmp" => return "image/bmp",
+            _ => {}
+        }
+    }
+    "image/jpeg"
 }
 
 pub async fn create_folder(
@@ -1046,5 +1389,59 @@ mod tests {
         let ioreg = r#"    |   "UsbExclusiveOwner" = "pid 607, ptpcamerad""#;
         assert_eq!(owner_from_ioreg(ioreg).as_deref(), Some("macOS Image Capture"));
         assert_eq!(owner_from_ioreg(r#""UsbExclusiveOwner" = "pid 9, coreaudiod""#), None);
+    }
+
+    #[test]
+    fn sorts_folders_first_then_newer_to_older() {
+        let mut entries = vec![
+            UsbEntry { handle: "1".into(), name: "old.jpg".into(), size: 10, folder: false, modified_ms: Some(1000), kind: "image" },
+            UsbEntry { handle: "2".into(), name: "new.jpg".into(), size: 10, folder: false, modified_ms: Some(3000), kind: "image" },
+            UsbEntry { handle: "3".into(), name: "undated.txt".into(), size: 10, folder: false, modified_ms: None, kind: "file" },
+            UsbEntry { handle: "4".into(), name: "DCIM".into(), size: 0, folder: true, modified_ms: Some(500), kind: "folder" },
+            UsbEntry { handle: "5".into(), name: "Download".into(), size: 0, folder: true, modified_ms: Some(2000), kind: "folder" },
+        ];
+        sort_entries(&mut entries);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Download", "DCIM", "new.jpg", "old.jpg", "undated.txt"]);
+    }
+
+    #[test]
+    fn matches_composite_and_named_mtp_interfaces() {
+        assert!(is_mtp_interface_summary(0x06, 0x01, 0x01, None));
+        assert!(is_mtp_interface_summary(0xFF, 0x01, 0x01, None));
+        assert!(is_mtp_interface_summary(0xFF, 0xFF, 0x00, Some("MTP USB Device")));
+        assert!(is_mtp_interface_summary(0xFF, 0xFF, 0x00, Some("Android MTP")));
+        assert!(!is_mtp_interface_summary(0xFF, 0x42, 0x01, Some("ADB Interface")));
+    }
+
+    #[test]
+    fn identifies_android_phones_in_charging_only_mode() {
+        // Samsung phone with ADB interface or vendor interface.
+        assert!(looks_like_android_non_mtp(0x04e8, 0x00, &[0xFF], true, Some("SAMSUNG"), Some("SAMSUNG_Android")));
+        assert!(looks_like_android_non_mtp(0x18d1, 0xEF, &[0x02, 0xFF], false, Some("Google"), Some("Pixel 9")));
+        // Apple devices, USB hubs, and HID mice/keyboards must never match.
+        assert!(!looks_like_android_non_mtp(APPLE_VENDOR_ID, 0x00, &[0xFF], false, Some("Apple"), Some("iPhone")));
+        assert!(!looks_like_android_non_mtp(0x04e8, 0x09, &[0x09], false, Some("Samsung"), Some("USB Hub")));
+        assert!(!looks_like_android_non_mtp(0x04e8, 0x00, &[0x03], false, Some("Samsung"), Some("Keyboard")));
+    }
+
+    #[test]
+    fn detects_image_mime_from_magic_and_extension() {
+        assert_eq!(image_mime("a.bin", b"\x89PNG\r\n\x1a\nrest"), "image/png");
+        assert_eq!(image_mime("a.bin", b"\xff\xd8\xff\xe0rest"), "image/jpeg");
+        assert_eq!(image_mime("a.bin", b"RIFFxxxxWEBPrest"), "image/webp");
+        assert_eq!(image_mime("photo.heic", b"unknown"), "image/heic");
+    }
+
+    #[test]
+    fn recognises_macos_not_responding_io_error() {
+        assert!(is_not_responding_msg("I/O error: unknown (error 0xe00002ed)"));
+        assert!(!is_not_responding_msg("permission denied"));
+        let err = UsbError::from(mtp_rs::Error::Io {
+            message: "unknown (error 0xe00002ed)".into(),
+        });
+        assert_eq!(err.code, "not-responding");
+        assert!(err.message.contains("0xe00002ed"));
+        assert!(err.message.contains("cable"));
     }
 }

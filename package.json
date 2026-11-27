@@ -1,10 +1,10 @@
 {
   "name": "sharelocal",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.3",
   "license": "MIT",
   "type": "module",
-  "description": "Direct file sharing over your local network \u2014 no cloud, no account.",
+  "description": "Direct file sharing over your local network — no cloud, no account.",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

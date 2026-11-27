@@ -47,14 +47,16 @@ async fn reaper(state: Arc<AppState>) {
             state.publish(crate::events::AppEvent::SessionRemoved { id });
         }
 
-        let mut clients = state.web_clients.write().await;
-        let stale: Vec<String> = clients
-            .iter()
-            .filter(|(_, c)| c.is_expired())
-            .map(|(id, _)| id.clone())
-            .collect();
+        let stale: Vec<String> = {
+            let clients = state.web_clients.read().await;
+            clients
+                .iter()
+                .filter(|(_, c)| c.is_expired())
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
         for id in stale {
-            clients.remove(&id);
+            state.forget_web_client(&id).await;
         }
     }
 }

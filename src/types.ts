@@ -177,6 +177,8 @@ export interface UsbDevice {
   name: string;
   serial: string | null;
   speed: string | null;
+  /** False when the phone is seen on USB but not in File transfer (MTP) mode yet. */
+  mtp_ready?: boolean;
 }
 
 export interface UsbStorage {

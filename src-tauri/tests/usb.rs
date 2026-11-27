@@ -235,6 +235,39 @@ async fn cancelling_mid_upload_removes_the_half_written_file() {
     assert!(!phone.root.join("big.mov").exists());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn lists_files_newer_to_older_and_serves_full_image_preview() {
+    use std::time::{Duration, SystemTime};
+    let phone = phone().await;
+
+    let older_path = phone.root.join("DCIM/Camera/IMG_0001.jpg");
+    let newer_path = phone.root.join("DCIM/Camera/IMG_0002.jpg");
+    // Write a tiny valid PNG header for preview testing and set distinct mtimes.
+    std::fs::write(&newer_path, b"\x89PNG\r\n\x1a\nfake-png-body").unwrap();
+    let old_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let new_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_750_000_000);
+    std::fs::File::options().write(true).open(&older_path).unwrap().set_modified(old_time).unwrap();
+    std::fs::File::options().write(true).open(&newer_path).unwrap().set_modified(new_time).unwrap();
+
+    let dcim = find(&phone, None, "DCIM").await;
+    let camera = find(&phone, Some(&dcim.handle), "Camera").await;
+    let items = list(&phone, Some(&camera.handle)).await;
+    // Folder first, then newer image before older image.
+    let names: Vec<&str> = items.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["Burst", "IMG_0002.jpg", "IMG_0001.jpg"]);
+
+    let preview = usb::preview(&phone.device, &phone.storage, &items[1].handle)
+        .await
+        .expect("image preview succeeds");
+    assert!(preview.starts_with("data:image/png;base64,"), "{preview}");
+
+    let notes = find(&phone, None, "notes.txt").await;
+    let err = usb::preview(&phone.device, &phone.storage, &notes.handle)
+        .await
+        .expect_err("non-images are rejected");
+    assert_eq!(err.code, "unsupported");
+}
+
 fn walk(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap().flatten() {

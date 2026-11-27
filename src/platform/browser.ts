@@ -29,6 +29,12 @@ const CLIENT_ID_KEY = "sharelocal.client-id";
 const HEARTBEAT_MS = 10_000;
 /** Silence after which the connection is assumed dead and reopened. */
 const HEARTBEAT_DEAD_MS = 30_000;
+/** Give up on a stalled CONNECTING handshake (common right after mobile sleep). */
+const CONNECT_TIMEOUT_MS = 8_000;
+/** How long to wait for a pong when probing a supposedly-open socket on wake. */
+const WAKE_PROBE_TIMEOUT_MS = 4_000;
+/** Server close code when the stored browser pairing token is no longer valid. */
+export const AUTH_EXPIRED_CLOSE_CODE = 4001;
 const CLIENT_TOKEN_KEY = "sharelocal.client-token";
 
 /**
@@ -148,12 +154,17 @@ export class ShareLocalClient {
   private token: string | null = storedToken();
   private socket: WebSocket | null = null;
   private reconnectTimer: number | null = null;
+  private connectTimer: number | null = null;
   private heartbeatTimer: number | null = null;
+  private probeTimer: number | null = null;
   private lastHeard = 0;
+  private connectStarted = 0;
+  private reconnectAttempt = 0;
   private wakeListenersAdded = false;
   private closed = false;
   private listeners = new Set<(event: AppEvent) => void>();
   private connectionListeners = new Set<(connected: boolean) => void>();
+  private authExpiredListeners = new Set<() => void>();
 
   /** Redeem a QR pairing token. Only needed once per browser. */
   async join(pairingToken: string): Promise<JoinResult> {
@@ -206,10 +217,59 @@ export class ShareLocalClient {
     return () => this.connectionListeners.delete(handler);
   }
 
+  onAuthExpired(handler: () => void): () => void {
+    this.authExpiredListeners.add(handler);
+    return () => this.authExpiredListeners.delete(handler);
+  }
+
+  private expireSession(): void {
+    this.token = null;
+    clearToken();
+    this.stopAllTimers();
+    if (this.socket) this.disposeSocket(this.socket);
+    this.connectionListeners.forEach((l) => l(false));
+    this.authExpiredListeners.forEach((l) => l());
+  }
+
+  /** Tear down a socket without letting its late close event disrupt a replacement. */
+  private disposeSocket(socket: WebSocket): void {
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onclose = null;
+    socket.onerror = null;
+    if (this.socket === socket) {
+      this.socket = null;
+      this.stopHeartbeat();
+      this.clearConnectTimer();
+      this.clearProbeTimer();
+    }
+    try {
+      socket.close();
+    } catch {
+      // Already closed.
+    }
+  }
+
+  /** Force an immediate fresh connection (e.g. after mobile sleep or user tap). */
+  reconnectNow(): void {
+    if (this.closed || !this.token) return;
+    this.reconnectAttempt = 0;
+    this.clearReconnectTimer();
+    if (this.socket) {
+      this.disposeSocket(this.socket);
+      this.connectionListeners.forEach((l) => l(false));
+    }
+    this.connect();
+  }
+
   /** Open the control channel, reconnecting on its own if the link drops. */
   connect(): void {
     if (this.closed || !this.token) return;
     if (this.socket && this.socket.readyState <= WebSocket.OPEN) return;
+
+    this.clearReconnectTimer();
+    this.clearConnectTimer();
+    this.clearProbeTimer();
 
     const scheme = window.location.protocol === "https:" ? "wss" : "ws";
     const url = `${scheme}://${window.location.host}/ws?client_id=${encodeURIComponent(
@@ -218,15 +278,30 @@ export class ShareLocalClient {
 
     const socket = new WebSocket(url);
     this.socket = socket;
+    this.connectStarted = Date.now();
     this.watchForWake();
 
+    // Mobile browsers waking from sleep frequently leave a WebSocket stuck in
+    // CONNECTING indefinitely; bound the handshake so we recover automatically.
+    this.connectTimer = window.setTimeout(() => {
+      if (this.socket !== socket || socket.readyState !== WebSocket.CONNECTING) return;
+      this.disposeSocket(socket);
+      this.connectionListeners.forEach((l) => l(false));
+      this.scheduleReconnect();
+    }, CONNECT_TIMEOUT_MS);
+
     socket.onopen = () => {
+      if (this.socket !== socket) return;
+      this.clearConnectTimer();
+      this.reconnectAttempt = 0;
       this.lastHeard = Date.now();
       this.startHeartbeat(socket);
       this.connectionListeners.forEach((l) => l(true));
     };
     socket.onmessage = (message) => {
+      if (this.socket !== socket) return;
       this.lastHeard = Date.now();
+      this.clearProbeTimer();
       try {
         const frame = JSON.parse(message.data);
         if (frame?.type === "event" && frame.event) {
@@ -236,16 +311,29 @@ export class ShareLocalClient {
         // A frame we cannot parse is not worth tearing the connection down for.
       }
     };
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       // An old socket replaced after a wake-up closes late; it must not mark
       // the new one as disconnected.
       if (this.socket !== socket) return;
       this.socket = null;
       this.stopHeartbeat();
+      this.clearConnectTimer();
+      this.clearProbeTimer();
+      if (event?.code === AUTH_EXPIRED_CLOSE_CODE) {
+        this.expireSession();
+        return;
+      }
       this.connectionListeners.forEach((l) => l(false));
       this.scheduleReconnect();
     };
-    socket.onerror = () => socket.close();
+    socket.onerror = () => {
+      if (this.socket !== socket) return;
+      try {
+        socket.close();
+      } catch {
+        // Ignore.
+      }
+    };
   }
 
   /**
@@ -257,15 +345,15 @@ export class ShareLocalClient {
   private startHeartbeat(socket: WebSocket): void {
     this.stopHeartbeat();
     this.heartbeatTimer = window.setInterval(() => {
-      if (socket.readyState !== WebSocket.OPEN) return;
+      if (this.socket !== socket || socket.readyState !== WebSocket.OPEN) return;
       if (Date.now() - this.lastHeard > HEARTBEAT_DEAD_MS) {
-        socket.close();
+        this.reconnectNow();
         return;
       }
       try {
         socket.send(JSON.stringify({ type: "ping", t: Date.now() }));
       } catch {
-        socket.close();
+        this.reconnectNow();
       }
     }, HEARTBEAT_MS);
   }
@@ -275,45 +363,90 @@ export class ShareLocalClient {
     this.heartbeatTimer = null;
   }
 
+  private clearConnectTimer(): void {
+    if (this.connectTimer !== null) window.clearTimeout(this.connectTimer);
+    this.connectTimer = null;
+  }
+
+  private clearProbeTimer(): void {
+    if (this.probeTimer !== null) window.clearTimeout(this.probeTimer);
+    this.probeTimer = null;
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
+
+  private stopAllTimers(): void {
+    this.stopHeartbeat();
+    this.clearConnectTimer();
+    this.clearProbeTimer();
+    this.clearReconnectTimer();
+  }
+
   /**
-   * Mobile browsers freeze a page in the background and kill its socket.
-   * Reconnect the moment the page is looked at again rather than waiting.
+   * Mobile browsers freeze a page in the background and kill or half-open its
+   * socket. Reconnect or probe liveness the moment the page comes back.
    */
   private watchForWake(): void {
     if (this.wakeListenersAdded || typeof document === "undefined") return;
     this.wakeListenersAdded = true;
     const wake = () => {
-      if (this.closed || document.visibilityState === "hidden") return;
+      if (this.closed || !this.token || document.visibilityState === "hidden") return;
       const socket = this.socket;
-      const dead =
-        !socket ||
-        socket.readyState > WebSocket.OPEN ||
-        (socket.readyState === WebSocket.OPEN && Date.now() - this.lastHeard > HEARTBEAT_DEAD_MS);
-      if (!dead) return;
-      socket?.close();
-      if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-      this.connect();
+      if (!socket || socket.readyState >= WebSocket.CLOSING) {
+        this.reconnectNow();
+        return;
+      }
+      if (socket.readyState === WebSocket.CONNECTING) {
+        // A handshake started before the phone slept is likely stuck; restart it.
+        if (Date.now() - this.connectStarted > 3_000) {
+          this.reconnectNow();
+        }
+        return;
+      }
+      // Socket claims to be OPEN: if it has been silent past the dead
+      // threshold, reopen immediately; otherwise send a fast probe ping so a
+      // half-open TCP socket is caught in seconds instead of waiting 30+ s.
+      if (Date.now() - this.lastHeard > HEARTBEAT_DEAD_MS) {
+        this.reconnectNow();
+        return;
+      }
+      try {
+        socket.send(JSON.stringify({ type: "ping", t: Date.now() }));
+      } catch {
+        this.reconnectNow();
+        return;
+      }
+      this.clearProbeTimer();
+      this.probeTimer = window.setTimeout(() => {
+        if (this.socket !== socket) return;
+        this.reconnectNow();
+      }, WAKE_PROBE_TIMEOUT_MS);
     };
     document.addEventListener("visibilitychange", wake);
+    document.addEventListener("resume", wake);
     window.addEventListener("pageshow", wake);
+    window.addEventListener("focus", wake);
     window.addEventListener("online", wake);
   }
 
   private scheduleReconnect(): void {
-    if (this.closed || this.reconnectTimer !== null) return;
+    if (this.closed || !this.token || this.reconnectTimer !== null) return;
+    const delays = [1000, 1500, 2500, 4000, 5000];
+    const delay = delays[Math.min(this.reconnectAttempt, delays.length - 1)]!;
+    this.reconnectAttempt += 1;
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();
-    }, 1500);
+    }, delay);
   }
 
   disconnect(): void {
     this.closed = true;
-    this.stopHeartbeat();
-    if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer);
-    this.socket?.close();
-    this.socket = null;
+    this.stopAllTimers();
+    if (this.socket) this.disposeSocket(this.socket);
   }
 
   /**
@@ -351,6 +484,7 @@ export class ShareLocalClient {
       signal: options.signal,
     });
     if (!offer.ok) {
+      if (offer.status === 401) this.expireSession();
       throw new Error(await describeError(offer, "The other device refused the transfer."));
     }
     const created = await offer.json();
@@ -495,6 +629,7 @@ export class ShareLocalClient {
       signal: options.signal,
     });
     if (!response.ok) {
+      if (response.status === 401) this.expireSession();
       throw new Error(await describeError(response, "The other device refused the text."));
     }
 

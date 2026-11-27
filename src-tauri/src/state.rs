@@ -18,7 +18,9 @@ use tokio::sync::{Mutex, Notify, RwLock};
 /// How long a QR pairing token stays valid.
 pub const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
 /// A browser client is forgotten after this long without a request.
-pub const WEB_CLIENT_TTL: Duration = Duration::from_secs(60 * 30);
+/// Kept generous so a paired phone that sleeps or is put away for hours
+/// still reconnects without forcing a fresh QR scan.
+pub const WEB_CLIENT_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 
 #[derive(Debug, Clone)]
 pub struct PairingToken {
@@ -318,6 +320,16 @@ impl AppState {
         }
         client.last_seen = Instant::now();
         Some(client.clone())
+    }
+
+    /// Update the remembered LAN address of a paired browser (e.g. after DHCP
+    /// renewal or waking from sleep) and refresh its liveness.
+    pub async fn update_web_client_addr(&self, client_id: &str, addr: IpAddr) {
+        let mut clients = self.web_clients.write().await;
+        if let Some(client) = clients.get_mut(client_id) {
+            client.addr = addr;
+            client.last_seen = Instant::now();
+        }
     }
 
     /// A paired browser is still connected: keep it listed as online.

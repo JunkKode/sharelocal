@@ -112,6 +112,7 @@ pub fn run() {
             crate::commands::usb_storages,
             crate::commands::usb_list,
             crate::commands::usb_thumbnail,
+            crate::commands::usb_preview,
             crate::commands::usb_create_folder,
             crate::commands::usb_delete,
             crate::commands::usb_download,

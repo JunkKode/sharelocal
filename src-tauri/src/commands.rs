@@ -690,6 +690,15 @@ pub async fn usb_thumbnail(
 }
 
 #[tauri::command]
+pub async fn usb_preview(
+    usb: State<'_, UsbState>,
+    storage: String,
+    handle: String,
+) -> UsbResult<String> {
+    with_phone(&usb, |d| async move { crate::usb::preview(&d, &storage, &handle).await }).await
+}
+
+#[tauri::command]
 pub async fn usb_create_folder(
     usb: State<'_, UsbState>,
     storage: String,

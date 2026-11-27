@@ -13,7 +13,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ShareLocalClient,
   browserIsSupported,
-  clearToken,
   describeBrowser,
   type UploadProgress,
 } from "../platform/browser";
@@ -100,26 +99,42 @@ export function BrowserApp() {
 
     (async () => {
       const token = pairingTokenFromUrl();
-      try {
-        if (token) {
+      if (token) {
+        try {
           await client.join(token);
           scrubPairingToken();
-        } else if (!client.paired) {
-          if (!cancelled) setPhase("needs-pairing");
-          return;
+        } catch (err) {
+          if (cancelled) return;
+          // If the browser is already paired (e.g. reopened a history/QR URL
+          // whose pairing token expired), keep the existing session and let the
+          // WebSocket verify whether it is still valid instead of wiping it.
+          if (client.paired) {
+            scrubPairingToken();
+          } else {
+            setPhase("needs-pairing");
+            notify("error", err instanceof Error ? err.message : "Could not connect.");
+            return;
+          }
         }
+      } else if (!client.paired) {
+        if (!cancelled) setPhase("needs-pairing");
+        return;
+      }
+
+      if (cancelled) return;
+      setPhase("ready");
+      client.connect();
+
+      // Fetching device info must never wipe a stored pairing token on a
+      // transient network hiccup (e.g. Wi-Fi still waking up when the browser
+      // reopens). If it fails now, the effect below retries once connected.
+      try {
         const info = await client.deviceInfo();
         if (cancelled) return;
         setDevice(info);
         setNeedsPin(info.pin_required);
-        setPhase("ready");
-        client.connect();
-      } catch (err) {
-        if (cancelled) return;
-        // A stale token in storage is the usual cause; force a fresh scan.
-        clearToken();
-        setPhase("needs-pairing");
-        notify("error", err instanceof Error ? err.message : "Could not connect.");
+      } catch {
+        // Reconnecting via WebSocket will trigger another fetch once online.
       }
     })();
 
@@ -128,9 +143,32 @@ export function BrowserApp() {
     };
   }, [client, notify]);
 
+  // Refresh device info whenever the control channel connects (covers reopening
+  // the browser before Wi-Fi settled, or PIN changes on the desktop).
+  useEffect(() => {
+    if (!client || !connected) return;
+    let cancelled = false;
+    client
+      .deviceInfo()
+      .then((info) => {
+        if (cancelled) return;
+        setDevice(info);
+        setNeedsPin(info.pin_required);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [client, connected]);
+
   useEffect(() => {
     if (!client) return;
     const offConnection = client.onConnectionChange(setConnected);
+    const offExpired = client.onAuthExpired(() => {
+      setConnected(false);
+      setPhase("needs-pairing");
+      notify("error", "This session expired — scan the QR code again.");
+    });
     const offEvent = client.onEvent((event: AppEvent) => {
       if (event.type === "incoming-offer" && event.session.role === "sending") {
         // The desktop is offering us files to download.
@@ -156,6 +194,7 @@ export function BrowserApp() {
     });
     return () => {
       offConnection();
+      offExpired();
       offEvent();
     };
   }, [client, notify]);
@@ -308,7 +347,20 @@ export function BrowserApp() {
             <span
               className={cx("size-1.5 rounded-full", connected ? "bg-emerald-500" : "bg-amber-500")}
             />
-            {connected ? "Connected on this network" : "Reconnecting…"}
+            {connected ? (
+              "Connected on this network"
+            ) : (
+              <>
+                <span>Reconnecting…</span>
+                <button
+                  type="button"
+                  onClick={() => client?.reconnectNow()}
+                  className="ml-1 font-medium text-brand-600 underline underline-offset-2 dark:text-brand-300"
+                >
+                  Retry
+                </button>
+              </>
+            )}
           </p>
         </div>
       </header>

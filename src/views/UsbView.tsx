@@ -33,6 +33,8 @@ export interface UsbApi {
   storages(): Promise<UsbStorage[]>;
   list(storage: string, parent: string | null, hidden?: boolean): Promise<UsbEntry[]>;
   thumbnail(storage: string, handle: string): Promise<string>;
+  /** Full image data URL for the hover preview tooltip (optional in tests). */
+  preview?(storage: string, handle: string): Promise<string>;
   createFolder(storage: string, parent: string | null, name: string): Promise<string>;
   remove(storage: string, handles: string[]): Promise<void>;
   download(storage: string, handles: string[], dest: string | null): Promise<string>;
@@ -52,6 +54,42 @@ type Notify = (level: "info" | "warn" | "error", message: string) => void;
 const POLL_MS = 2000;
 /** Thumbnails cost a USB round trip each; stop asking after this many. */
 const MAX_THUMBNAILS = 300;
+/** Keep at most this many full-size hover previews cached in memory. */
+const MAX_PREVIEW_CACHE = 24;
+/** Debounce full-image MTP reads so moving the mouse across rows stays snappy. */
+const PREVIEW_DEBOUNCE_MS = 220;
+
+type SortField = "modified" | "name" | "size";
+type SortDir = "asc" | "desc";
+
+interface HoverPreview {
+  entry: UsbEntry;
+  rect: { top: number; bottom: number; left: number; right: number; width: number };
+}
+
+function isMtpReady(device: UsbDevice): boolean {
+  return device.mtp_ready !== false;
+}
+
+function sortUsbEntries(entries: UsbEntry[], field: SortField, dir: SortDir): UsbEntry[] {
+  const factor = dir === "asc" ? 1 : -1;
+  return [...entries].sort((a, b) => {
+    if (a.folder !== b.folder) return a.folder ? -1 : 1;
+    if (field === "modified") {
+      if (a.modified_ms !== b.modified_ms) {
+        if (a.modified_ms === null) return 1;
+        if (b.modified_ms === null) return -1;
+        return (a.modified_ms - b.modified_ms) * factor;
+      }
+      return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+    }
+    if (field === "size") {
+      if (a.size !== b.size) return (a.size - b.size) * factor;
+      return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+    }
+    return a.name.toLowerCase().localeCompare(b.name.toLowerCase()) * factor;
+  });
+}
 
 interface Crumb {
   handle: string;
@@ -101,6 +139,10 @@ export function UsbView({
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [thumbs, setThumbs] = useState<Record<string, string>>({});
+  const [previews, setPreviews] = useState<Record<string, string>>({});
+  const [hovered, setHovered] = useState<HoverPreview | null>(null);
+  const [loadingPreview, setLoadingPreview] = useState<string | null>(null);
+  const [sort, setSort] = useState<{ field: SortField; dir: SortDir }>({ field: "modified", dir: "desc" });
   const [progress, setProgress] = useState<UsbProgress | null>(null);
   const [newFolder, setNewFolder] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -175,22 +217,25 @@ export function UsbView({
 
   const errorDevice = (error as (UsbError & { deviceId?: string }) | null)?.deviceId ?? null;
 
+  const readyDevices = useMemo(() => (devices ? devices.filter(isMtpReady) : null), [devices]);
+
   // Open the phone as soon as it appears; notice when it goes away.
   useEffect(() => {
-    if (!devices) return;
-    if (conn && !devices.some((d) => d.id === conn.id)) {
+    if (!readyDevices) return;
+    if (conn && !readyDevices.some((d) => d.id === conn.id)) {
       setConn(null);
       setEntries([]);
+      setHovered(null);
       setProgress((p) => (p && !p.finished ? null : p));
       notify("info", `${conn.name} was unplugged.`);
       void api.disconnect();
       return;
     }
-    if (errorDevice && !devices.some((d) => d.id === errorDevice)) setError(null);
+    if (errorDevice && !readyDevices.some((d) => d.id === errorDevice)) setError(null);
     if (conn || connecting || error) return;
-    const first = devices.find((d) => d.id !== dismissedId);
+    const first = readyDevices.find((d) => d.id !== dismissedId);
     if (first) void connect(first.id, false);
-  }, [devices, conn, connecting, error, errorDevice, dismissedId, connect, api, notify]);
+  }, [readyDevices, conn, connecting, error, errorDevice, dismissedId, connect, api, notify]);
 
   // A locked phone shows no storage; try again by itself once it is unlocked.
   useEffect(() => {
@@ -261,14 +306,81 @@ export function UsbView({
   useEffect(() => {
     setSelected(new Set());
     setEntries([]);
+    setHovered(null);
     void refresh();
   }, [refresh]);
 
-  // Thumbnails, one at a time, for the photos in view.
+  const sortedEntries = useMemo(
+    () => sortUsbEntries(entries, sort.field, sort.dir),
+    [entries, sort.field, sort.dir],
+  );
+
+  const toggleSort = (field: SortField) => {
+    setSort((current) =>
+      current.field === field
+        ? { field, dir: current.dir === "desc" ? "asc" : "desc" }
+        : { field, dir: field === "name" ? "asc" : "desc" },
+    );
+  };
+
+  // Dismiss the hover preview when scrolling so it never floats detached from its row.
+  useEffect(() => {
+    if (!hovered) return;
+    const clear = () => setHovered(null);
+    window.addEventListener("scroll", clear, true);
+    return () => window.removeEventListener("scroll", clear, true);
+  }, [hovered]);
+
+  // Upgrade an image hover tooltip from its low-res MTP thumbnail to the full
+  // image after a brief dwell, cached in memory so re-hovering is instant.
+  useEffect(() => {
+    const entry = hovered?.entry;
+    if (!entry || entry.kind !== "image" || !storage || !api.preview || busy) {
+      setLoadingPreview(null);
+      return;
+    }
+    if (entry.handle in previews) {
+      setLoadingPreview(null);
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      setLoadingPreview(entry.handle);
+      api
+        .preview!(storage.id, entry.handle)
+        .then((url) => {
+          if (cancelled) return;
+          setPreviews((current) => {
+            const keys = Object.keys(current);
+            const next: Record<string, string> = {};
+            const keep = keys.slice(-(MAX_PREVIEW_CACHE - 1));
+            for (const k of keep) next[k] = current[k]!;
+            next[entry.handle] = url;
+            return next;
+          });
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setPreviews((current) => ({ ...current, [entry.handle]: "" }));
+        })
+        .finally(() => {
+          if (!cancelled) setLoadingPreview((cur) => (cur === entry.handle ? null : cur));
+        });
+    }, PREVIEW_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      setLoadingPreview(null);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hovered?.entry.handle, storage, api, busy]);
+
+  // Thumbnails, one at a time, for the photos in view (newest first).
   useEffect(() => {
     if (!conn?.thumbnails || !storage) return;
     let cancelled = false;
-    const wanted = entries
+    const wanted = sortedEntries
       .filter((e) => e.kind === "image" || e.kind === "video")
       .slice(0, MAX_THUMBNAILS)
       .filter((e) => !(e.handle in thumbs));
@@ -288,7 +400,7 @@ export function UsbView({
     };
     // `thumbs` is deliberately left out: it changes on every fetched image.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [entries, conn, storage, api, busy]);
+  }, [sortedEntries, conn, storage, api, busy]);
 
   // ---------------------------------------------------------- transfers
 
@@ -612,37 +724,6 @@ export function UsbView({
           ))}
         </nav>
 
-        {/* Selection bar */}
-        {selected.size > 0 ? (
-          <div className="sticky top-0 z-10 mb-2 flex flex-wrap items-center gap-2 rounded-xl bg-brand-50 px-3 py-2 ring-1 ring-brand-200 dark:bg-brand-500/10 dark:ring-brand-500/30">
-            <span className="text-sm font-medium text-brand-800 dark:text-brand-200">
-              {selected.size} selected
-              {selectedBytes > 0 ? ` · ${formatBytes(selectedBytes)}${hasFolderSelected ? "+" : ""}` : ""}
-            </span>
-            <div className="ml-auto flex flex-wrap gap-2">
-              <Button size="sm" variant="primary" icon="download" disabled={busy} onClick={() => void download(null)}>
-                Copy to Downloads
-              </Button>
-              <Button
-                size="sm"
-                icon="folder"
-                disabled={busy}
-                onClick={() =>
-                  void api.pickDestination().then((dest) => {
-                    if (dest) void download(dest);
-                  })
-                }
-              >
-                Copy to…
-              </Button>
-              {conn.can_delete ? (
-                <IconButton label="Delete from phone" icon="trash" disabled={busy} onClick={() => setConfirmDelete(true)} />
-              ) : null}
-              <IconButton label="Clear selection" icon="close" onClick={() => setSelected(new Set())} />
-            </div>
-          </div>
-        ) : null}
-
         {/* Listing */}
         <div
           className={cx(
@@ -655,13 +736,31 @@ export function UsbView({
               type="checkbox"
               aria-label="Select all"
               checked={allSelected}
-              disabled={entries.length === 0}
-              onChange={() => setSelected(allSelected ? new Set() : new Set(entries.map((e) => e.handle)))}
+              disabled={sortedEntries.length === 0}
+              onChange={() => setSelected(allSelected ? new Set() : new Set(sortedEntries.map((e) => e.handle)))}
               className="size-4 accent-brand-600"
             />
-            <span className="flex-1">Name</span>
-            <span className="hidden w-28 text-right sm:block">Modified</span>
-            <span className="w-20 text-right">Size</span>
+            <SortHeader
+              label="Name"
+              active={sort.field === "name"}
+              dir={sort.dir}
+              onClick={() => toggleSort("name")}
+              className="flex-1 justify-start"
+            />
+            <SortHeader
+              label="Modified"
+              active={sort.field === "modified"}
+              dir={sort.dir}
+              onClick={() => toggleSort("modified")}
+              className="hidden w-28 justify-end sm:inline-flex"
+            />
+            <SortHeader
+              label="Size"
+              active={sort.field === "size"}
+              dir={sort.dir}
+              onClick={() => toggleSort("size")}
+              className="w-20 justify-end"
+            />
           </div>
 
           {newFolder !== null ? (
@@ -704,7 +803,7 @@ export function UsbView({
           ) : (
             // No scroll box of its own: the page scrolls, once.
             <ul>
-              {entries.map((entry) => (
+              {sortedEntries.map((entry) => (
                 <EntryRow
                   key={entry.handle}
                   entry={entry}
@@ -715,16 +814,33 @@ export function UsbView({
                     if (entry.folder) navigate([...path, { handle: entry.handle, name: entry.name }]);
                     else toggle(entry.handle);
                   }}
+                  onHoverPreview={(rect) => {
+                    if (entry.kind === "image" || (entry.kind === "video" && thumbs[entry.handle])) {
+                      setHovered({ entry, rect });
+                    }
+                  }}
+                  onLeavePreview={() => {
+                    setHovered((cur) => (cur?.entry.handle === entry.handle ? null : cur));
+                  }}
                 />
               ))}
             </ul>
           )}
         </div>
 
+        {hovered ? (
+          <ImagePreviewTooltip
+            hovered={hovered}
+            fullSrc={previews[hovered.entry.handle] || undefined}
+            thumbSrc={thumbs[hovered.entry.handle] || undefined}
+            loading={loadingPreview === hovered.entry.handle}
+          />
+        ) : null}
+
         <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
         <p className="text-xs text-ink-500 dark:text-ink-400">
           {conn.can_upload ? "Drag files or folders from Finder onto this window to copy them here. " : ""}
-          Double-click a folder to open it.
+          Click a folder to open it.
         </p>
           <label className="flex items-center gap-2 text-xs text-ink-600 dark:text-ink-300">
             <input
@@ -736,6 +852,41 @@ export function UsbView({
             Show hidden files
           </label>
         </div>
+
+        {/* Sticky bottom selection bar: placed below the listing so checking a
+            checkbox never shifts the rows above it. */}
+        {selected.size > 0 ? (
+          <div
+            data-selection-bar
+            className="sticky bottom-4 z-20 mt-3 flex flex-wrap items-center gap-2 rounded-xl bg-brand-50/95 px-3 py-2 shadow-lg ring-1 ring-brand-200 backdrop-blur dark:bg-ink-900/95 dark:ring-brand-500/40"
+          >
+            <span className="text-sm font-medium text-brand-800 dark:text-brand-200">
+              {selected.size} selected
+              {selectedBytes > 0 ? ` · ${formatBytes(selectedBytes)}${hasFolderSelected ? "+" : ""}` : ""}
+            </span>
+            <div className="ml-auto flex flex-wrap gap-2">
+              <Button size="sm" variant="primary" icon="download" disabled={busy} onClick={() => void download(null)}>
+                Copy to Downloads
+              </Button>
+              <Button
+                size="sm"
+                icon="folder"
+                disabled={busy}
+                onClick={() =>
+                  void api.pickDestination().then((dest) => {
+                    if (dest) void download(dest);
+                  })
+                }
+              >
+                Copy to…
+              </Button>
+              {conn.can_delete ? (
+                <IconButton label="Delete from phone" icon="trash" disabled={busy} onClick={() => setConfirmDelete(true)} />
+              ) : null}
+              <IconButton label="Clear selection" icon="close" onClick={() => setSelected(new Set())} />
+            </div>
+          </div>
+        ) : null}
       </section>
 
       {dropActive ? (
@@ -773,33 +924,74 @@ export function UsbView({
   );
 }
 
+function SortHeader({
+  label,
+  active,
+  dir,
+  onClick,
+  className,
+}: {
+  label: string;
+  active: boolean;
+  dir: SortDir;
+  onClick: () => void;
+  className?: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={`Sort by ${label}`}
+      className={cx(
+        "inline-flex items-center gap-1 rounded transition hover:text-ink-900 dark:hover:text-white",
+        active && "font-semibold text-ink-800 dark:text-ink-100",
+        className,
+      )}
+    >
+      <span>{label}</span>
+      {active ? <span aria-hidden>{dir === "desc" ? "↓" : "↑"}</span> : null}
+    </button>
+  );
+}
+
 function EntryRow({
   entry,
   thumb,
   selected,
   onToggle,
   onOpen,
+  onHoverPreview,
+  onLeavePreview,
 }: {
   entry: UsbEntry;
   thumb: string | undefined;
   selected: boolean;
   onToggle: () => void;
   onOpen: () => void;
+  onHoverPreview: (rect: HoverPreview["rect"]) => void;
+  onLeavePreview: () => void;
 }) {
   // Dot-files are hidden on the phone; shown faded so they read as such.
   const hiddenFile = entry.name.startsWith(".");
   const fade = hiddenFile && "opacity-45";
+  const canPreview = entry.kind === "image" || (entry.kind === "video" && Boolean(thumb));
+  const thumbRef = useRef<HTMLSpanElement | null>(null);
+  const triggerPreview = () => {
+    if (!canPreview || !thumbRef.current) return;
+    const r = thumbRef.current.getBoundingClientRect();
+    onHoverPreview({ top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.width });
+  };
   return (
     <li
       title={hiddenFile ? "Hidden" : undefined}
       className={cx(
-        "flex cursor-default items-center gap-3 border-b border-ink-100 px-3 py-1.5 last:border-0 dark:border-ink-800",
+        "flex items-center gap-3 border-b border-ink-100 px-3 py-1.5 last:border-0 dark:border-ink-800",
+        entry.folder ? "cursor-pointer" : "cursor-default",
         selected ? "bg-brand-50 dark:bg-brand-500/10" : "hover:bg-ink-50 dark:hover:bg-ink-800/50",
       )}
-      onDoubleClick={entry.folder ? onOpen : undefined}
-      onClick={(e) => {
-        // Single click on a folder name opens it; elsewhere it selects.
-        if ((e.target as HTMLElement).closest("[data-open]")) onOpen();
+      onClick={() => {
+        // Clicking anywhere on a folder row opens it; checkboxes handle selection.
+        if (entry.folder) onOpen();
         else onToggle();
       }}
     >
@@ -812,8 +1004,13 @@ function EntryRow({
         className="size-4 accent-brand-600"
       />
       <span
+        ref={thumbRef}
+        data-thumb
+        onMouseEnter={canPreview ? triggerPreview : undefined}
+        onMouseLeave={canPreview ? onLeavePreview : undefined}
         className={cx(
           "grid size-9 shrink-0 place-items-center overflow-hidden rounded-lg bg-ink-100 text-ink-500 dark:bg-ink-800 dark:text-ink-400",
+          canPreview && "cursor-zoom-in",
           fade,
         )}
       >
@@ -846,6 +1043,79 @@ function EntryRow({
         {entry.folder ? "—" : formatBytes(entry.size)}
       </span>
     </li>
+  );
+}
+
+/**
+ * Full-aspect-ratio floating preview shown when hovering over an image/video
+ * row. Placed above or below the row (never covering the checkbox or filename)
+ * and clamped inside the viewport.
+ */
+function ImagePreviewTooltip({
+  hovered,
+  fullSrc,
+  thumbSrc,
+  loading,
+}: {
+  hovered: HoverPreview;
+  fullSrc?: string;
+  thumbSrc?: string;
+  loading: boolean;
+}) {
+  const [fullFailed, setFullFailed] = useState(false);
+  useEffect(() => setFullFailed(false), [hovered.entry.handle, fullSrc]);
+
+  const src = (!fullFailed && fullSrc) || thumbSrc;
+  if (!src && !loading) return null;
+
+  const vw = typeof window !== "undefined" ? window.innerWidth : 1024;
+  const vh = typeof window !== "undefined" ? window.innerHeight : 768;
+  const cardWidth = Math.min(352, vw - 24);
+  const estimatedHeight = 360;
+  const spaceAbove = hovered.rect.top;
+  const spaceBelow = vh - hovered.rect.bottom;
+  const placeAbove = spaceBelow < estimatedHeight && spaceAbove > spaceBelow;
+  const left = Math.max(12, Math.min(hovered.rect.left, vw - cardWidth - 12));
+  const style: React.CSSProperties = placeAbove
+    ? { left, bottom: Math.max(12, vh - hovered.rect.top + 8), maxWidth: cardWidth }
+    : { left, top: Math.min(vh - 120, hovered.rect.bottom + 8), maxWidth: cardWidth };
+
+  return (
+    <div
+      role="tooltip"
+      aria-label={`Preview of ${hovered.entry.name}`}
+      style={style}
+      className="pointer-events-none fixed z-50 overflow-hidden rounded-xl2 bg-white p-2 shadow-2xl ring-1 ring-ink-200/90 dark:bg-ink-900 dark:ring-ink-700"
+    >
+      <div className="relative flex max-h-80 min-h-24 min-w-44 items-center justify-center overflow-hidden rounded-lg bg-ink-100 dark:bg-ink-950">
+        {src ? (
+          <img
+            src={src}
+            alt={hovered.entry.name}
+            onError={() => {
+              if (src === fullSrc) setFullFailed(true);
+            }}
+            className="max-h-80 max-w-80 w-auto h-auto object-contain"
+          />
+        ) : (
+          <div className="flex items-center gap-2 px-6 py-8 text-xs text-ink-500">
+            <Spinner className="size-4" /> Loading preview…
+          </div>
+        )}
+        {loading && src ? (
+          <span className="absolute right-2 bottom-2 rounded-full bg-black/60 p-1 text-white">
+            <Spinner className="size-3" />
+          </span>
+        ) : null}
+      </div>
+      <div className="mt-1.5 flex items-baseline justify-between gap-3 px-1 text-xs">
+        <span className="truncate font-medium text-ink-900 dark:text-ink-100">{hovered.entry.name}</span>
+        <span className="shrink-0 tabular-nums text-ink-500 dark:text-ink-400">
+          {formatBytes(hovered.entry.size)}
+          {hovered.entry.modified_ms ? ` · ${formatDate(hovered.entry.modified_ms)}` : ""}
+        </span>
+      </div>
+    </div>
   );
 }
 
@@ -966,7 +1236,9 @@ function NotConnected({
   error: (UsbError & { deviceId?: string }) | null;
   onConnect: (id: string, release: boolean) => void;
 }) {
-  const device = devices?.find((d) => d.id === error?.deviceId) ?? devices?.[0] ?? null;
+  const ready = devices?.filter(isMtpReady) ?? [];
+  const chargingOnly = devices?.find((d) => !isMtpReady(d)) ?? null;
+  const device = ready.find((d) => d.id === error?.deviceId) ?? ready[0] ?? null;
 
   if (connecting) {
     return (
@@ -1024,6 +1296,21 @@ function NotConnected({
     );
   }
 
+  if (!device && chargingOnly) {
+    return (
+      <Panel icon="usb" tone="warn" title={`${chargingOnly.name} is connected for charging only`}>
+        <p>
+          This Mac sees your phone over the USB cable, so the cable works — the phone just has not
+          enabled File transfer yet.
+        </p>
+        <SetupSteps />
+        <p className="mt-4 flex items-center gap-2 text-xs text-ink-500 dark:text-ink-400">
+          <Spinner className="size-3.5" /> Waiting for “File transfer” to be selected…
+        </p>
+      </Panel>
+    );
+  }
+
   return (
     <Panel icon="usb" tone="neutral" title="Plug in your Android phone">
       <p>
@@ -1043,7 +1330,8 @@ function SetupSteps() {
   return (
     <ol className="mt-4 space-y-2 text-sm text-ink-700 dark:text-ink-300">
       {[
-        "Connect the phone to this Mac with a USB cable that carries data (some charge-only cables do not).",
+        "Connect the phone to this Mac with a USB cable that carries data. Some phone charger cables only carry power — if the phone charges without showing a USB notification, try another cable.",
+        "If macOS asks “Allow accessory to connect?”, click Allow.",
         "Unlock the phone.",
         "Swipe down from the top of the phone, tap the “USB” notification (“Charging this device via USB”), and choose “File transfer”.",
         "If the phone asks “Allow access to phone data?”, tap Allow.",

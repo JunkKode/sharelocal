@@ -1,5 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  AUTH_EXPIRED_CLOSE_CODE,
+  ShareLocalClient,
   browserIsSupported,
   describeBrowser,
   localClientId,
@@ -147,5 +149,119 @@ describe("secure-context independence", () => {
 
     spy.mockRestore();
     setSpy.mockRestore();
+  });
+});
+
+class FakeWebSocket {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSING = 2;
+  static readonly CLOSED = 3;
+  static instances: FakeWebSocket[] = [];
+
+  readyState = FakeWebSocket.CONNECTING;
+  sent: string[] = [];
+  onopen: (() => void) | null = null;
+  onmessage: ((ev: { data: string }) => void) | null = null;
+  onclose: ((ev: { code?: number }) => void) | null = null;
+  onerror: (() => void) | null = null;
+
+  constructor(public url: string) {
+    FakeWebSocket.instances.push(this);
+  }
+
+  send(data: string) {
+    this.sent.push(data);
+  }
+
+  open() {
+    this.readyState = FakeWebSocket.OPEN;
+    this.onopen?.();
+  }
+
+  receive(frame: unknown) {
+    this.onmessage?.({ data: JSON.stringify(frame) });
+  }
+
+  close(code = 1000) {
+    if (this.readyState === FakeWebSocket.CLOSED) return;
+    this.readyState = FakeWebSocket.CLOSED;
+    this.onclose?.({ code });
+  }
+}
+
+describe("ShareLocalClient reconnection", () => {
+  const OriginalWebSocket = globalThis.WebSocket;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    localStorage.clear();
+    FakeWebSocket.instances = [];
+    // @ts-expect-error test double
+    globalThis.WebSocket = FakeWebSocket;
+  });
+
+  afterEach(() => {
+    globalThis.WebSocket = OriginalWebSocket;
+    vi.useRealTimers();
+  });
+
+  it("recovers when a socket gets stuck in CONNECTING during mobile sleep", () => {
+    storeToken("valid-token");
+    const client = new ShareLocalClient();
+    const states: boolean[] = [];
+    client.onConnectionChange((c) => states.push(c));
+
+    client.connect();
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    const first = FakeWebSocket.instances[0]!;
+    expect(first.readyState).toBe(FakeWebSocket.CONNECTING);
+
+    // 4 seconds later, the user wakes the phone and returns to the tab.
+    vi.advanceTimersByTime(4_000);
+    document.dispatchEvent(new Event("visibilitychange"));
+
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    const second = FakeWebSocket.instances[1]!;
+    second.open();
+    expect(states[states.length - 1]).toBe(true);
+    client.disconnect();
+  });
+
+  it("probes an OPEN socket on wake and reconnects if it is half-open", () => {
+    storeToken("valid-token");
+    const client = new ShareLocalClient();
+    client.connect();
+    const first = FakeWebSocket.instances[0]!;
+    first.open();
+
+    // Wake while socket still claims OPEN; client sends an immediate ping probe.
+    vi.advanceTimersByTime(5_000);
+    window.dispatchEvent(new Event("focus"));
+    expect(first.sent.some((m) => m.includes('"type":"ping"'))).toBe(true);
+
+    // No pong arrives within 4 seconds → half-open socket is replaced.
+    vi.advanceTimersByTime(4_500);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    client.disconnect();
+  });
+
+  it("clears the stored token and notifies when the server closes with 4001", () => {
+    storeToken("expired-token");
+    const client = new ShareLocalClient();
+    const expired = vi.fn();
+    client.onAuthExpired(expired);
+
+    client.connect();
+    const sock = FakeWebSocket.instances[0]!;
+    sock.close(AUTH_EXPIRED_CLOSE_CODE);
+
+    expect(expired).toHaveBeenCalledTimes(1);
+    expect(storedToken()).toBeNull();
+    expect(client.paired).toBe(false);
+    // Must not keep retrying with a rejected token.
+    vi.advanceTimersByTime(10_000);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    client.disconnect();
   });
 });

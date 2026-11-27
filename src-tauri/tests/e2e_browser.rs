@@ -519,3 +519,63 @@ async fn a_connected_phone_stays_online_past_the_peer_ttl() {
     assert_eq!(peer.status, PeerStatus::Online, "an open page must not age out");
     reader.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_rejects_expired_browser_token_with_4001() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let node = start_node("Studio Mac", true).await;
+    let url = format!("{}?client_id=web-unknownphone1&token=stale-token", node.ws_url());
+    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    let first = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("server closes promptly")
+        .expect("close frame present")
+        .expect("valid ws frame");
+    match first {
+        Message::Close(Some(frame)) => {
+            assert_eq!(
+                u16::from(frame.code),
+                sharelocal::server::ws::CLOSE_AUTH_EXPIRED
+            );
+        }
+        other => panic!("expected close 4001, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reconnecting_phone_becomes_online_and_receives_pending_offers() {
+    use futures_util::StreamExt;
+    use sharelocal::model::PeerStatus;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let node = start_node("Studio Mac", true).await;
+    let (_url, pairing) = node.state.issue_pairing().await;
+    let body: serde_json::Value = join(&node, &pairing, "77889900aabbccdd").await.json().await.unwrap();
+    let client_id = body["client_id"].as_str().unwrap().to_string();
+    let token = body["client_token"].as_str().unwrap().to_string();
+
+    // Offer a file while the phone has no open WebSocket (e.g. asleep / closed).
+    let source = node.dir.join("notes.pdf");
+    make_file(&source, 1024);
+    let session_id = sharelocal::transfer::send::offer_to_web(&node.state, &client_id, vec![source], None)
+        .await
+        .expect("offer succeeds");
+
+    // Phone reopens browser and connects WS — it should immediately receive the pending offer.
+    let url = format!("{}?client_id={client_id}&token={token}", node.ws_url());
+    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("replayed offer arrives")
+        .expect("frame")
+        .expect("ok");
+    let Message::Text(text) = frame else {
+        panic!("expected text frame, got {frame:?}");
+    };
+    assert!(text.contains(&session_id), "pending offer must be replayed on reconnect: {text}");
+    let peer = node.state.peers.read().await.get(&client_id).expect("peer present");
+    assert_eq!(peer.status, PeerStatus::Online);
+}
